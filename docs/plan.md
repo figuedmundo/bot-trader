@@ -361,6 +361,18 @@ Use whichever format your OpenCode build validates. Tool identifiers will be pre
 - **Audit trail.** Every MCP-driven action and scan result is logged in SQLite.
 - **Local-only dashboard.** Read-only, localhost-bound, no auth in MVP.
 
+## 10.1 Market Data API Fallback Notes
+
+The MVP scanner can start with free/public sources, but public scraping cannot guarantee 100% reliability because sites may rate-limit, block, change HTML, or require browser sessions. If Scanner A becomes a daily dependency, add an official market-data fallback.
+
+Recommended fallback ranking:
+
+1. **Primary recommendation: Polygon.io / Massive.com Starter** — best fit for premarket gappers. Use the stocks gainers/losers snapshot endpoint or full market snapshot to compute custom gap %, price, and volume. This is the preferred official fallback for the scanner.
+2. **Budget option: Finnhub** — useful as a lower-cost starting point, especially for company news/catalyst coverage, but less ideal as the main premarket movers source.
+3. **Premium option: Polygon Advanced** — appropriate if the scanner becomes production-critical and needs more complete real-time/SIP-level data.
+
+Avoid relying on Alpaca's movers endpoint as the primary premarket gappers source: its documented behavior resets at market open and can show the previous market day's movers before the open, which does not match the premarket scanner requirement.
+
 ## 11. Roadmap
 
 ### Phase 0 — Foundation (Week 1)
