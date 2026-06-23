@@ -1,0 +1,22 @@
+{
+  "name": "bot-trader",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local TradingView MCP research pipeline for scans, SQLite persistence, and alerts.",
+  "license": "UNLICENSED",
+  "scripts": {
+    "migrate": "node scripts/migrate.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3"
+    ]
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "packageManager": "pnpm@10.12.4"
+}
