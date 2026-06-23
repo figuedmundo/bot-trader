@@ -7,12 +7,29 @@
 node_modules/
 dashboard/node_modules/
 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
 # External local checkouts
 tradingview-mcp/
 
 # Runtime data
+.cache/
 data/*.db
 data/*.db-*
+premarket_gappers_*.json
 logs/
 *.log
 

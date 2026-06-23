@@ -8,6 +8,26 @@ Phase 0 is being finalized. TradingView MCP is configured through `opencode.json
 
 The next milestone is Phase 1: create the SQLite foundation and the first premarket gap scanner.
 
+## Premarket gappers scanner
+
+The premarket scanner is a Python script that writes a dated JSON file at the repo root:
+
+```bash
+python3 scripts/scanner-premarket.py
+```
+
+Output files match `premarket_gappers_YYYY-MM-DD.json` and are ignored by git because they are runtime scan artifacts.
+
+The scanner is stdlib-only by default. For more reliable JS-rendered fallback scraping, install optional Crawl4AI support:
+
+```bash
+python3 -m pip install crawl4ai
+crawl4ai-setup
+crawl4ai-doctor
+```
+
+Crawl4AI is used only as a fallback when normal HTTP fetches fail or return browser-gated pages; it does not guarantee that public data sources will always be available.
+
 ## Planned MVP
 
 - Read a static watchlist from `data/watchlist.json`.
