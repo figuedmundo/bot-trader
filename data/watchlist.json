@@ -1,0 +1,16 @@
+{
+  "name": "mvp-us-equities",
+  "description": "Small starter watchlist for Phase 1 premarket gap scanner testing.",
+  "symbols": [
+    "NASDAQ:NVDA",
+    "NASDAQ:TSLA",
+    "NASDAQ:AAPL",
+    "NASDAQ:AMD",
+    "NASDAQ:MSFT",
+    "NASDAQ:META",
+    "NASDAQ:AMZN",
+    "NASDAQ:GOOGL",
+    "NASDAQ:SMCI",
+    "NYSE:PLTR"
+  ]
+}

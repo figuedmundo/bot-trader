@@ -1,0 +1,18 @@
+{
+  "scannerName": "premarket-gap-scan",
+  "timezone": "America/New_York",
+  "schedule": {
+    "time": "09:25",
+    "marketDaysOnly": true
+  },
+  "criteria": {
+    "minGapPct": 3,
+    "minPremarketVolume": 300000,
+    "minPrice": 2,
+    "maxResults": 10
+  },
+  "data": {
+    "watchlistPath": "data/watchlist.json",
+    "databasePath": "data/bot-trader.db"
+  }
+}
