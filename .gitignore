@@ -1,0 +1,39 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+dashboard/node_modules/
+
+# External local checkouts
+tradingview-mcp/
+
+# Runtime data
+data/*.db
+data/*.db-*
+logs/
+*.log
+
+# Tool/runtime state
+.sisyphus/
+.opencode/
+.agents/
+skills-lock.json
+
+# Build and test output
+dist/
+build/
+coverage/
+.nyc_output/
+
+# Package-manager logs
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+
+# OS/editor noise
+.DS_Store
+*.swp
+*.swo
