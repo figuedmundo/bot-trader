@@ -8,11 +8,13 @@ requested JSON shape, and prints a one-line summary.
 
 from __future__ import annotations
 
+import argparse
 import html
-import hashlib
+import importlib
 import json
 import random
 import re
+import sqlite3
 import sys
 import time
 import urllib.error
@@ -20,12 +22,14 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = ROOT_DIR / "data"
+DEFAULT_DB_PATH = DATA_DIR / "bot-trader.db"
 YAHOO_GAINERS_PAGE_URL = "https://finance.yahoo.com/markets/stocks/gainers/"
 YAHOO_SCREENER_URLS = [
     "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
@@ -36,8 +40,6 @@ YAHOO_SCREENER_URLS = [
 MAX_RESULTS = 10
 REQUEST_TIMEOUT_SECONDS = 15
 REQUEST_ATTEMPTS = 3
-RAW_CACHE_DIR = ROOT_DIR / ".cache" / "premarket-scanner"
-RAW_CACHE_MAX_AGE = timedelta(hours=18)
 CATALYST_WORKERS = 4
 
 USER_AGENTS = [
@@ -71,6 +73,32 @@ class Gapper:
     premarket_volume: int
 
 
+@dataclass(frozen=True)
+class ScannerOptions:
+    log: bool = False
+
+
+def parse_args(argv: list[str] | None = None) -> ScannerOptions:
+    parser = argparse.ArgumentParser(description="Scan and summarize premarket gappers.")
+    parser.add_argument(
+        "--log",
+        "--verbose",
+        dest="log",
+        action="store_true",
+        help="Print detailed scanner progress to stderr.",
+    )
+    args = parser.parse_args(argv)
+    return ScannerOptions(log=args.log)
+
+
+def log_message(options: ScannerOptions | None, message: str) -> None:
+    if not options or not options.log:
+        return
+
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    print(f"[{timestamp}] {message}", file=sys.stderr)
+
+
 def today_iso_date() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
@@ -90,6 +118,38 @@ def load_scanner_config() -> dict[str, Any]:
         return {}
 
 
+def scanner_name() -> str:
+    return str(load_scanner_config().get("scannerName", "premarket-gap-scan"))
+
+
+def database_path() -> Path:
+    configured = load_scanner_config().get("data", {}).get("databasePath")
+    if not configured:
+        return DEFAULT_DB_PATH
+
+    path = Path(str(configured))
+    return path if path.is_absolute() else ROOT_DIR / path
+
+
+def watchlist_snapshot() -> list[str]:
+    configured = load_scanner_config().get("data", {}).get("watchlistPath", "data/watchlist.json")
+    path = Path(str(configured))
+    watchlist_path = path if path.is_absolute() else ROOT_DIR / path
+    if not watchlist_path.exists():
+        return []
+
+    try:
+        payload = json.loads(watchlist_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+
+    symbols = payload.get("symbols") if isinstance(payload, dict) else payload
+    if not isinstance(symbols, list):
+        return []
+
+    return [str(symbol) for symbol in symbols if isinstance(symbol, str) and symbol.strip()]
+
+
 def scanner_criteria() -> dict[str, float | int]:
     criteria = load_scanner_config().get("criteria", {})
     return {
@@ -100,30 +160,79 @@ def scanner_criteria() -> dict[str, float | int]:
     }
 
 
-def cache_path_for_url(url: str) -> Path:
-    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
-    return RAW_CACHE_DIR / f"{digest}.txt"
+def config_criteria_snapshot() -> dict[str, Any]:
+    criteria = load_scanner_config().get("criteria", {})
+    return dict(criteria) if isinstance(criteria, dict) else {}
 
 
-def cache_is_fresh(path: Path, max_age: timedelta = RAW_CACHE_MAX_AGE) -> bool:
-    if not path.exists():
-        return False
-
-    modified_at = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
-    return datetime.now(timezone.utc) - modified_at <= max_age
+def benzinga_quote_url(symbol: str) -> str:
+    return f"https://www.benzinga.com/quote/{urllib.parse.quote(symbol)}"
 
 
-def read_cached_text(url: str, max_age: timedelta = RAW_CACHE_MAX_AGE) -> str | None:
-    path = cache_path_for_url(url)
-    if not cache_is_fresh(path, max_age):
-        return None
+def persist_scan_run(
+    gappers: list[dict[str, Any]],
+    *,
+    status: str,
+    error_message: str | None = None,
+    db_path: Path | None = None,
+    artifact_path: Path | None = None,
+) -> int:
+    target_db_path = db_path or database_path()
+    target_db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    return path.read_text(encoding="utf-8", errors="replace")
+    connection = sqlite3.connect(target_db_path)
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        cursor = connection.cursor()
+        with connection:
+            cursor.execute(
+                """
+                INSERT INTO scan_runs (scanner_name, watchlist, criteria, status, error_message)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    scanner_name(),
+                    json.dumps(watchlist_snapshot(), separators=(",", ":")),
+                    json.dumps(config_criteria_snapshot(), separators=(",", ":")),
+                    status,
+                    error_message,
+                ),
+            )
+            if cursor.lastrowid is None:
+                raise RuntimeError("SQLite did not return a scan_runs row id")
+            scan_run_id = cursor.lastrowid
 
+            for gapper in gappers:
+                symbol = str(gapper["symbol"])
+                metadata = {
+                    "rank": gapper.get("rank"),
+                    "catalyst": gapper.get("catalyst"),
+                    "headlines": gapper.get("headlines", []),
+                    "catalyst_method": "regex" if gapper.get("catalyst") or gapper.get("headlines") else "none",
+                    "benzinga_url": benzinga_quote_url(symbol),
+                }
+                if artifact_path:
+                    metadata["artifact_path"] = str(artifact_path)
 
-def write_cached_text(url: str, body: str) -> None:
-    RAW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_path_for_url(url).write_text(body, encoding="utf-8")
+                cursor.execute(
+                    """
+                    INSERT INTO scan_results (
+                      scan_run_id, symbol, gap_pct, premarket_volume, price, timeframe, metadata
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        scan_run_id,
+                        symbol,
+                        gapper.get("gap_pct"),
+                        gapper.get("premarket_volume"),
+                        gapper.get("price"),
+                        None,
+                        json.dumps(metadata, separators=(",", ":")),
+                    ),
+                )
+        return scan_run_id
+    finally:
+        connection.close()
 
 
 def as_number(value: Any) -> float | None:
@@ -167,55 +276,60 @@ def build_headers(headers: dict[str, str] | None = None, attempt: int = 0) -> di
     return {**BASE_HEADERS, "User-Agent": user_agent, **(headers or {})}
 
 
-def fetch_text(url: str, headers: dict[str, str] | None = None, use_cache: bool = True) -> str:
-    cached = read_cached_text(url) if use_cache else None
+def fetch_text(
+    url: str,
+    headers: dict[str, str] | None = None,
+    options: ScannerOptions | None = None,
+) -> str:
     errors: list[str] = []
 
     for attempt in range(REQUEST_ATTEMPTS):
         try:
+            log_message(options, f"fetch attempt {attempt + 1}/{REQUEST_ATTEMPTS}: {url}")
             request = urllib.request.Request(url, headers=build_headers(headers, attempt))
             with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                 charset = response.headers.get_content_charset() or "utf-8"
                 body = response.read().decode(charset, errors="replace")
-                if use_cache:
-                    write_cached_text(url, body)
+                log_message(options, f"fetched {len(body)} chars: {url}")
                 return body
         except (OSError, urllib.error.URLError, urllib.error.HTTPError) as error:
             errors.append(str(error))
+            log_message(options, f"fetch failed on attempt {attempt + 1}/{REQUEST_ATTEMPTS}: {url} ({error})")
             if attempt < REQUEST_ATTEMPTS - 1:
                 time.sleep((2**attempt) + random.uniform(0.1, 0.7))
-
-    if cached is not None:
-        print(f"Using cached response for {url} after fetch failures: {'; '.join(errors)}", file=sys.stderr)
-        return cached
 
     raise RuntimeError("; ".join(errors))
 
 
-def crawl4ai_fetch_text(url: str) -> str | None:
+def crawl4ai_fetch_text(url: str, options: ScannerOptions | None = None) -> str | None:
     """Best-effort optional browser-rendered fetch.
 
     Crawl4AI is intentionally optional. If it is not installed and initialized,
-    the scanner still works with urllib + cache/retry fallbacks.
+    the scanner still works with urllib retries and explicit errors.
     """
     try:
         import asyncio
-        from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
+        crawl4ai = importlib.import_module("crawl4ai")
     except ImportError:
+        log_message(options, "Crawl4AI fallback unavailable: package is not installed")
         return None
 
     async def crawl() -> str | None:
-        browser_config = BrowserConfig(headless=True, verbose=False)
-        run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
-        async with AsyncWebCrawler(config=browser_config) as crawler:
+        browser_config = crawl4ai.BrowserConfig(headless=True, verbose=False)
+        run_config = crawl4ai.CrawlerRunConfig(cache_mode=crawl4ai.CacheMode.BYPASS)
+        async with crawl4ai.AsyncWebCrawler(config=browser_config) as crawler:
             result = await crawler.arun(url=url, config=run_config)
             if not result.success:
+                log_message(options, f"Crawl4AI fallback failed for {url}")
                 return None
+            log_message(options, f"Crawl4AI fallback succeeded for {url}")
             return result.html or getattr(result.markdown, "raw_markdown", None) or str(result.markdown or "")
 
     try:
+        log_message(options, f"starting Crawl4AI fallback: {url}")
         return asyncio.run(crawl())
-    except Exception:
+    except Exception as error:
+        log_message(options, f"Crawl4AI fallback errored for {url}: {error}")
         return None
 
 
@@ -243,18 +357,28 @@ def parse_yahoo_quote(raw_quote: dict[str, Any]) -> Gapper | None:
     )
 
 
-def fetch_yahoo_gainers() -> list[Gapper]:
+def fetch_yahoo_gainers(options: ScannerOptions | None = None) -> list[Gapper]:
     errors: list[str] = []
     criteria = scanner_criteria()
+    log_message(
+        options,
+        "scanner criteria: "
+        f"min_gap_pct={criteria['min_gap_pct']}, "
+        f"min_price={criteria['min_price']}, "
+        f"min_premarket_volume={criteria['min_premarket_volume']}, "
+        f"max_results={criteria['max_results']}",
+    )
 
     for url in YAHOO_SCREENER_URLS:
         try:
+            log_message(options, f"loading Yahoo screener endpoint: {url}")
             body = fetch_text(
                 url,
                 headers={
                     "Accept": "application/json",
                     "Referer": YAHOO_GAINERS_PAGE_URL,
                 },
+                options=options,
             )
             payload = json.loads(body)
             quotes = payload.get("finance", {}).get("result", [{}])[0].get("quotes")
@@ -263,7 +387,7 @@ def fetch_yahoo_gainers() -> list[Gapper]:
                 raise ValueError("Yahoo response did not include finance.result[0].quotes")
 
             parsed = [quote for quote in (parse_yahoo_quote(raw_quote) for raw_quote in quotes) if quote]
-            return sorted(
+            filtered = sorted(
                 (
                     quote
                     for quote in parsed
@@ -274,14 +398,22 @@ def fetch_yahoo_gainers() -> list[Gapper]:
                 key=lambda quote: quote.gap_pct,
                 reverse=True,
             )[: int(criteria["max_results"])]
+            log_message(
+                options,
+                f"Yahoo endpoint returned {len(quotes)} raw quotes, parsed {len(parsed)}, "
+                f"kept {len(filtered)}: {', '.join(quote.symbol for quote in filtered) or 'none'}",
+            )
+            return filtered
         except (OSError, urllib.error.URLError, urllib.error.HTTPError, RuntimeError, ValueError, json.JSONDecodeError) as error:
             errors.append(f"{url}: {error}")
+            log_message(options, f"Yahoo screener endpoint failed: {url} ({error})")
 
-    html_body = crawl4ai_fetch_text(YAHOO_GAINERS_PAGE_URL)
+    log_message(options, "Yahoo JSON endpoints failed; trying rendered Yahoo page fallback")
+    html_body = crawl4ai_fetch_text(YAHOO_GAINERS_PAGE_URL, options)
     if html_body:
         parsed = parse_yahoo_gainers_from_html(html_body)
         if parsed:
-            return sorted(
+            filtered = sorted(
                 (
                     quote
                     for quote in parsed
@@ -292,6 +424,12 @@ def fetch_yahoo_gainers() -> list[Gapper]:
                 key=lambda quote: quote.gap_pct,
                 reverse=True,
             )[: int(criteria["max_results"])]
+            log_message(
+                options,
+                f"Yahoo HTML fallback parsed {len(parsed)} quotes, kept {len(filtered)}: "
+                f"{', '.join(quote.symbol for quote in filtered) or 'none'}",
+            )
+            return filtered
 
     raise RuntimeError(f"Yahoo gainers source failed ({'; '.join(errors)})")
 
@@ -358,21 +496,31 @@ def extract_catalyst(headlines: list[str], symbol: str) -> str | None:
     return first if symbol in first else f"{symbol}: {first}"
 
 
-def fetch_catalyst(symbol: str) -> dict[str, Any]:
+def fetch_catalyst(symbol: str, options: ScannerOptions | None = None) -> dict[str, Any]:
     try:
-        quote_url = f"https://www.benzinga.com/quote/{urllib.parse.quote(symbol)}"
+        quote_url = benzinga_quote_url(symbol)
+        log_message(options, f"loading Benzinga catalyst page for {symbol}: {quote_url}")
         page_html = fetch_text(
             quote_url,
             headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+            options=options,
         )
         if "Just a moment" in page_html or "enable JavaScript" in page_html:
-            page_html = crawl4ai_fetch_text(quote_url) or page_html
+            log_message(options, f"Benzinga page for {symbol} appears browser-gated; trying Crawl4AI")
+            page_html = crawl4ai_fetch_text(quote_url, options) or page_html
         headlines = extract_headlines(page_html, symbol)
+        catalyst = extract_catalyst(headlines, symbol)
+        log_message(
+            options,
+            f"catalyst lookup for {symbol}: {len(headlines)} headline(s), "
+            f"catalyst={'found' if catalyst else 'not found'}",
+        )
         return {
-            "catalyst": extract_catalyst(headlines, symbol),
+            "catalyst": catalyst,
             "headlines": headlines,
         }
-    except (OSError, urllib.error.URLError, urllib.error.HTTPError, RuntimeError):
+    except (OSError, urllib.error.URLError, urllib.error.HTTPError, RuntimeError) as error:
+        log_message(options, f"catalyst lookup failed for {symbol}: {error}")
         return {"catalyst": None, "headlines": []}
 
 
@@ -397,18 +545,24 @@ def write_output(gappers: list[dict[str, Any]]) -> None:
     output_path_for_today().write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    options = parse_args(argv)
+    log_message(options, "starting premarket gappers scan")
+    artifact_written = False
+
     try:
-        filtered = fetch_yahoo_gainers()
+        filtered = fetch_yahoo_gainers(options)
         enriched_by_symbol: dict[str, dict[str, Any]] = {}
+        log_message(options, f"fetching catalysts for {len(filtered)} symbol(s)")
 
         with ThreadPoolExecutor(max_workers=CATALYST_WORKERS) as executor:
-            futures = {executor.submit(fetch_catalyst, gapper.symbol): gapper for gapper in filtered}
+            futures = {executor.submit(fetch_catalyst, gapper.symbol, options): gapper for gapper in filtered}
             for future in as_completed(futures):
                 gapper = futures[future]
                 try:
                     enriched_by_symbol[gapper.symbol] = future.result()
                 except Exception:
+                    log_message(options, f"unexpected catalyst worker error for {gapper.symbol}")
                     enriched_by_symbol[gapper.symbol] = {"catalyst": None, "headlines": []}
 
         enriched = []
@@ -427,10 +581,24 @@ def main() -> int:
             )
 
         write_output(enriched)
+        artifact_written = True
+        artifact_path = output_path_for_today()
+        log_message(options, f"wrote scan output to {artifact_path}")
+        status = "success" if enriched else "empty"
+        scan_run_id = persist_scan_run(enriched, status=status, artifact_path=artifact_path)
+        log_message(options, f"persisted scan_run_id={scan_run_id} to {database_path()}")
         print(format_summary(enriched))
         return 0
     except Exception as error:
-        write_output([])
+        if not artifact_written:
+            write_output([])
+        artifact_path = output_path_for_today()
+        try:
+            scan_run_id = persist_scan_run([], status="error", error_message=str(error), artifact_path=artifact_path)
+            log_message(options, f"persisted failed scan_run_id={scan_run_id} to {database_path()}")
+        except Exception as db_error:
+            log_message(options, f"failed to persist error scan: {db_error}")
+        log_message(options, f"scan failed: {error}")
         print(f"Premarket gappers scan failed: {error}", file=sys.stderr)
         print("Premarket Gappers: 0 names. Top:")
         return 1
