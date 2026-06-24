@@ -37,7 +37,7 @@ Build a local, AI-assisted trading research pipeline on macOS. **OpenCode** driv
 │         ▼                                                                │
 │  ┌──────────────────────────────┐        ┌───────────────────────────┐  │
 │  │     Local Workspace          │        │   Dashboard Web App       │  │
-│  │  - scan scripts (Node)       │        │  - Hono server (Node)     │  │
+│  │  - scan scripts (Python)     │        │  - Hono server (Node)     │  │
 │  │  - watchlists (JSON)         │ read   │  - HTMX + Tailwind +      │  │
 │  │  - Pine Script templates     │◄───────┤    Chart.js / uPlot       │  │
 │  │  - .env (gitignored)         │        │  - binds to localhost     │  │

@@ -16,6 +16,12 @@ The premarket scanner is a Python script that writes a dated JSON file at the re
 python3 scripts/scanner-premarket.py
 ```
 
+For troubleshooting source data, run it with detailed progress logs on stderr:
+
+```bash
+python3 scripts/scanner-premarket.py --log
+```
+
 Output files match `premarket_gappers_YYYY-MM-DD.json` and are ignored by git because they are runtime scan artifacts.
 
 The scanner is stdlib-only by default. For more reliable JS-rendered fallback scraping, install optional Crawl4AI support:
