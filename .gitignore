@@ -30,6 +30,7 @@ tradingview-mcp/
 data/*.db
 data/*.db-*
 premarket_gappers_*.json
+tjl_watchlist_*.json
 logs/
 *.log
 
