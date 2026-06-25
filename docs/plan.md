@@ -9,6 +9,7 @@ Build a local, AI-assisted trading research pipeline on macOS. **OpenCode** driv
 ### Goals
 - Automate premarket gap scans from a defined watchlist.
 - Run a post-open strategy scanner on the symbols produced by the gap scan.
+- Maintain the first experimental Trend Join Long strategy scanner as an OpenCode-collected, Python-evaluated demo over `AMD`, `NVDA`, and `MU`.
 - Backtest candidate setups using Pine Script inside TradingView.
 - Persist scan results, backtests, alerts, and logs in SQLite for querying and historical analysis.
 - Provide a local web dashboard to visualize scan results, trends, and backtest metrics.

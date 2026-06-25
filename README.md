@@ -34,6 +34,18 @@ crawl4ai-doctor
 
 Crawl4AI is used only as a fallback when normal HTTP fetches fail or return browser-gated pages; it does not guarantee that public data sources will always be available.
 
+## Trend Join Long scanner
+
+The Trend Join Long scanner evaluates OpenCode-collected TradingView MCP data for the demo universe `AMD`, `NVDA`, and `MU`:
+
+```bash
+python3 scripts/scanner-trend-join-long.py --input path/to/tjl-input.json
+```
+
+OpenCode should collect the live chart data sequentially through the TradingView MCP bridge, then pass normalized daily, quote, and 1-minute data into this script. Output files match `tjl_watchlist_YYYY-MM-DD_HHMMET.json` and are ignored by git because they are runtime scan artifacts.
+
+For fixture-based development outside market hours, pass `--allow-outside-hours`. The default behavior still refuses to evaluate outside `10:00–15:30 America/New_York`.
+
 ## Planned MVP
 
 - Read a static watchlist from `data/watchlist.json`.
