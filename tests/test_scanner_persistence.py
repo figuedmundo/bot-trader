@@ -4,6 +4,7 @@ import importlib.util
 import json
 import sqlite3
 import sys
+from contextlib import closing
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -25,31 +26,32 @@ def load_scanner_module() -> Any:
 
 
 def create_schema(db_path: Path) -> None:
-    with sqlite3.connect(db_path) as connection:
-        connection.executescript(
-            """
-            CREATE TABLE scan_runs (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              scanner_name TEXT NOT NULL,
-              run_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-              watchlist TEXT,
-              criteria TEXT,
-              status TEXT NOT NULL CHECK (status IN ('success', 'error', 'empty')),
-              error_message TEXT
-            );
+    with closing(sqlite3.connect(db_path)) as connection:
+        with connection:
+            connection.executescript(
+                """
+                CREATE TABLE scan_runs (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  scanner_name TEXT NOT NULL,
+                  run_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                  watchlist TEXT,
+                  criteria TEXT,
+                  status TEXT NOT NULL CHECK (status IN ('success', 'error', 'empty')),
+                  error_message TEXT
+                );
 
-            CREATE TABLE scan_results (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              scan_run_id INTEGER NOT NULL REFERENCES scan_runs(id) ON DELETE CASCADE,
-              symbol TEXT NOT NULL,
-              gap_pct REAL,
-              premarket_volume INTEGER,
-              price REAL,
-              timeframe TEXT,
-              metadata TEXT
-            );
-            """
-        )
+                CREATE TABLE scan_results (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  scan_run_id INTEGER NOT NULL REFERENCES scan_runs(id) ON DELETE CASCADE,
+                  symbol TEXT NOT NULL,
+                  gap_pct REAL,
+                  premarket_volume INTEGER,
+                  price REAL,
+                  timeframe TEXT,
+                  metadata TEXT
+                );
+                """
+            )
 
 
 class ScannerPersistenceTests(unittest.TestCase):
@@ -77,7 +79,7 @@ class ScannerPersistenceTests(unittest.TestCase):
                 artifact_path=Path("premarket_gappers_2026-06-24.json"),
             )
 
-            with sqlite3.connect(db_path) as connection:
+            with closing(sqlite3.connect(db_path)) as connection:
                 connection.row_factory = sqlite3.Row
                 run = connection.execute("SELECT * FROM scan_runs WHERE id = ?", (scan_run_id,)).fetchone()
                 result = connection.execute("SELECT * FROM scan_results WHERE scan_run_id = ?", (scan_run_id,)).fetchone()
@@ -140,7 +142,7 @@ class ScannerPersistenceTests(unittest.TestCase):
             self.assertIsNone(artifact["gappers"][0]["catalyst"])
             self.assertEqual(artifact["gappers"][0]["headlines"], [])
 
-            with sqlite3.connect(db_path) as connection:
+            with closing(sqlite3.connect(db_path)) as connection:
                 connection.row_factory = sqlite3.Row
                 run = connection.execute("SELECT * FROM scan_runs").fetchone()
                 result = connection.execute("SELECT * FROM scan_results").fetchone()
