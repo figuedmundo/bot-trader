@@ -5,7 +5,8 @@
   "description": "Local TradingView MCP research pipeline for scans, SQLite persistence, and alerts.",
   "license": "UNLICENSED",
   "scripts": {
-    "migrate": "node scripts/migrate.js"
+    "migrate": "node scripts/migrate.js",
+    "dashboard": "node dashboard/server.js"
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1"

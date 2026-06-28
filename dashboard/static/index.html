@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bot Trader Dashboard</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <noscript>
+      <section class="panel empty-state span-12" style="margin:1rem;">
+        <p class="eyebrow">JavaScript required</p>
+        <h2>Enable JavaScript to view the dashboard</h2>
+        <p class="muted">The Bot Trader dashboard is rendered client-side. Please enable JavaScript and open this page through the dashboard server (e.g. <code>http://127.0.0.1:3020</code>), not by double-clicking <code>index.html</code>.</p>
+      </section>
+    </noscript>
+    <div class="app-shell">
+      <div class="ambient ambient-a"></div>
+      <div class="ambient ambient-b"></div>
+
+      <header class="hero panel panel-hero">
+        <div>
+          <p class="eyebrow">Local research cockpit</p>
+          <h1>Bot Trader Dashboard</h1>
+          <p class="hero-copy">
+            A single-screen pulse check for the premarket scan, collector handoff, and Trend Join Long outcomes.
+          </p>
+        </div>
+
+        <div class="hero-meta" id="hero-meta">
+          <div class="metric-card skeleton"></div>
+          <div class="metric-card skeleton"></div>
+          <div class="metric-card skeleton"></div>
+        </div>
+      </header>
+
+      <main id="app" class="dashboard-grid" aria-live="polite">
+        <section class="panel empty-state span-12" id="app-loading">
+          <p class="eyebrow">Initializing</p>
+          <h2>Loading dashboard...</h2>
+          <p class="muted">Connecting to the local dashboard server and pulling the latest snapshot.</p>
+        </section>
+      </main>
+    </div>
+
+    <template id="empty-state-template">
+      <section class="panel empty-state">
+        <p class="eyebrow">Awaiting data</p>
+        <h2></h2>
+        <p class="muted"></p>
+      </section>
+    </template>
+
+    <script src="/app.js" defer></script>
+  </body>
+  </html>
