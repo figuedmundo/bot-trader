@@ -72,6 +72,9 @@ class ScannerPersistenceTests(unittest.TestCase):
                         "premarket_volume": 1_200_000,
                         "catalyst": "Beat Q1 earnings and raised guidance",
                         "headlines": ["Apple Reports Strong Q1", "Analysts Boost Price Targets"],
+                        "catalyst_method": "tradingview-groq",
+                        "catalyst_error": None,
+                        "news_url": "https://www.tradingview.com/symbols/NASDAQ-AAPL/news/",
                     }
                 ],
                 status="success",
@@ -100,9 +103,10 @@ class ScannerPersistenceTests(unittest.TestCase):
             self.assertEqual(metadata["rank"], 1)
             self.assertEqual(metadata["catalyst"], "Beat Q1 earnings and raised guidance")
             self.assertEqual(metadata["headlines"], ["Apple Reports Strong Q1", "Analysts Boost Price Targets"])
-            self.assertEqual(metadata["catalyst_method"], "regex")
+            self.assertEqual(metadata["catalyst_method"], "tradingview-groq")
+            self.assertIsNone(metadata["catalyst_error"])
             self.assertEqual(metadata["artifact_path"], "premarket_gappers_2026-06-24.json")
-            self.assertEqual(metadata["benzinga_url"], "https://www.benzinga.com/quote/AAPL")
+            self.assertEqual(metadata["news_url"], "https://www.tradingview.com/symbols/NASDAQ-AAPL/news/")
 
     def test_main_persists_success_when_catalyst_worker_fails(self) -> None:
         scanner = load_scanner_module()
@@ -120,7 +124,7 @@ class ScannerPersistenceTests(unittest.TestCase):
 
             scanner.fetch_yahoo_gainers = lambda options=None: [scanner.Gapper("AAPL", 175.2, 7.5, 1_200_000)]
 
-            def raise_catalyst_error(symbol: str, options=None):
+            def raise_catalyst_error(symbol: str, tv_symbol=None, options=None):
                 raise RuntimeError(f"catalyst failed for {symbol}")
 
             scanner.fetch_catalyst = raise_catalyst_error
@@ -141,6 +145,7 @@ class ScannerPersistenceTests(unittest.TestCase):
             self.assertEqual(len(artifact["gappers"]), 1)
             self.assertIsNone(artifact["gappers"][0]["catalyst"])
             self.assertEqual(artifact["gappers"][0]["headlines"], [])
+            self.assertEqual(artifact["gappers"][0]["catalyst_error"], "catalyst failed for AAPL")
 
             with closing(sqlite3.connect(db_path)) as connection:
                 connection.row_factory = sqlite3.Row
@@ -153,7 +158,41 @@ class ScannerPersistenceTests(unittest.TestCase):
             metadata = json.loads(result["metadata"])
             self.assertIsNone(metadata["catalyst"])
             self.assertEqual(metadata["headlines"], [])
-            self.assertEqual(metadata["catalyst_method"], "none")
+            self.assertEqual(metadata["catalyst_method"], "error")
+            self.assertEqual(metadata["catalyst_error"], "catalyst failed for AAPL")
+            self.assertIsNone(metadata.get("news_url"))
+
+    def test_fetch_catalyst_preserves_headlines_when_groq_fails(self) -> None:
+        scanner = load_scanner_module()
+
+        original_fetch_symbol_news = scanner.fetch_symbol_news
+        original_summarize = scanner.summarize_catalyst_with_groq
+
+        scanner.fetch_symbol_news = lambda symbol, tv_symbol=None, options=None: {
+            "headlines": ["Headline one", "Headline two"],
+            "details": [
+                {"title": "Headline one", "teaser": "Teaser one"},
+                {"title": "Headline two", "teaser": "Teaser two"},
+            ],
+            "source_url": "https://www.tradingview.com/symbols/NASDAQ-AAPL/news/",
+        }
+
+        def raise_groq(symbol: str, details: list[dict[str, str]], options=None) -> str:
+            raise RuntimeError("Groq request failed: boom")
+
+        scanner.summarize_catalyst_with_groq = raise_groq
+
+        try:
+            result = scanner.fetch_catalyst("AAPL")
+        finally:
+            scanner.fetch_symbol_news = original_fetch_symbol_news
+            scanner.summarize_catalyst_with_groq = original_summarize
+
+        self.assertIsNone(result["catalyst"])
+        self.assertEqual(result["headlines"], ["Headline one", "Headline two"])
+        self.assertEqual(result["catalyst_method"], "error")
+        self.assertEqual(result["catalyst_error"], "Groq request failed: boom")
+        self.assertEqual(result["news_url"], "https://www.tradingview.com/symbols/NASDAQ-AAPL/news/")
 
 
 if __name__ == "__main__":

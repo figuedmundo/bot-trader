@@ -2,8 +2,8 @@
 """Premarket gappers scanner.
 
 Fetches Yahoo's day-gainers screener data, filters the largest movers, enriches
-the top names with best-effort Benzinga quote-page catalyst snippets, writes the
-requested JSON shape, and prints a one-line summary.
+the top names with TradingView news headlines and Groq catalyst summaries, writes
+the requested JSON shape, and prints a one-line summary.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import argparse
 import html
 import importlib
 import json
+import os
 import random
 import re
 import sqlite3
@@ -40,7 +41,24 @@ YAHOO_SCREENER_URLS = [
 MAX_RESULTS = 10
 REQUEST_TIMEOUT_SECONDS = 15
 REQUEST_ATTEMPTS = 3
-CATALYST_WORKERS = 4
+CATALYST_WORKERS = 2
+GROQ_MAX_RETRIES = 4
+GROQ_RETRY_BASE_SECONDS = 12.0
+TRADINGVIEW_NEWS_HOST = "https://news-headlines.tradingview.com"
+TRADINGVIEW_SCANNER_HOST = "https://scanner.tradingview.com"
+TRADINGVIEW_WEB_HOST = "https://www.tradingview.com"
+
+# Curated over ~300 columns — see skills/tradingview/references/SCANNER_COLUMNS.md
+DEFAULT_TV_ENRICHMENT_COLUMNS = [
+    "change_from_open",
+    "Recommend.All",
+    "market_cap_basic",
+    "sector",
+    "industry",
+    "RSI",
+    "Perf.W",
+    "price_52_week_high",
+]
 
 USER_AGENTS = [
     (
@@ -71,6 +89,8 @@ class Gapper:
     price: float
     gap_pct: float
     premarket_volume: int
+    exchange: str = ""
+    tv_symbol: str = ""
 
 
 @dataclass(frozen=True)
@@ -169,6 +189,44 @@ def benzinga_quote_url(symbol: str) -> str:
     return f"https://www.benzinga.com/quote/{urllib.parse.quote(symbol)}"
 
 
+def read_env_value(name: str) -> str | None:
+    value = os.getenv(name)
+    if value:
+        return value
+
+    env_path = ROOT_DIR / ".env"
+    if not env_path.exists():
+        return None
+
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, raw_value = stripped.split("=", 1)
+        if key.strip() != name:
+            continue
+        candidate = raw_value.strip().strip('"').strip("'")
+        return candidate or None
+
+    return None
+
+
+YAHOO_TO_TV_EXCHANGE = {
+    "NMS": "NASDAQ",
+    "NGM": "NASDAQ",
+    "NCM": "NASDAQ",
+    "NYQ": "NYSE",
+    "ASE": "AMEX",
+    "PCX": "ARCA",
+    "OEM": "OTC",
+    "PNK": "OTC",
+}
+
+
+def yahoo_exchange_to_tv(exchange_code: str) -> str:
+    return YAHOO_TO_TV_EXCHANGE.get(exchange_code, exchange_code)
+
+
 def persist_scan_run(
     gappers: list[dict[str, Any]],
     *,
@@ -208,8 +266,13 @@ def persist_scan_run(
                     "rank": gapper.get("rank"),
                     "catalyst": gapper.get("catalyst"),
                     "headlines": gapper.get("headlines", []),
-                    "catalyst_method": "regex" if gapper.get("catalyst") or gapper.get("headlines") else "none",
-                    "benzinga_url": benzinga_quote_url(symbol),
+                    "news_items": gapper.get("news_items", []),
+                    "catalyst_method": gapper.get("catalyst_method") or ("tradingview-groq" if gapper.get("catalyst") else "none"),
+                    "catalyst_error": gapper.get("catalyst_error"),
+                    "news_url": gapper.get("news_url"),
+                    "exchange": gapper.get("exchange"),
+                    "tv_symbol": gapper.get("tv_symbol"),
+                    "tv_enrichment": gapper.get("tv_enrichment"),
                 }
                 if artifact_path:
                     metadata["artifact_path"] = str(artifact_path)
@@ -301,43 +364,73 @@ def fetch_text(
     raise RuntimeError("; ".join(errors))
 
 
-def crawl4ai_fetch_text(url: str, options: ScannerOptions | None = None) -> str | None:
-    """Best-effort optional browser-rendered fetch.
-
-    Crawl4AI is intentionally optional. If it is not installed and initialized,
-    the scanner still works with urllib retries and explicit errors.
-    """
-    try:
-        import asyncio
-        crawl4ai = importlib.import_module("crawl4ai")
-    except ImportError:
-        log_message(options, "Crawl4AI fallback unavailable: package is not installed")
-        return None
-
-    async def crawl() -> str | None:
-        browser_config = crawl4ai.BrowserConfig(headless=True, verbose=False)
-        run_config = crawl4ai.CrawlerRunConfig(cache_mode=crawl4ai.CacheMode.BYPASS)
-        async with crawl4ai.AsyncWebCrawler(config=browser_config) as crawler:
-            result = await crawler.arun(url=url, config=run_config)
-            if not result.success:
-                log_message(options, f"Crawl4AI fallback failed for {url}")
-                return None
-            log_message(options, f"Crawl4AI fallback succeeded for {url}")
-            return result.html or getattr(result.markdown, "raw_markdown", None) or str(result.markdown or "")
-
-    try:
-        log_message(options, f"starting Crawl4AI fallback: {url}")
-        return asyncio.run(crawl())
-    except Exception as error:
-        log_message(options, f"Crawl4AI fallback errored for {url}: {error}")
-        return None
-
-
 def strip_html(value: str) -> str:
     without_scripts = re.sub(r"<script[\s\S]*?</script>", " ", value, flags=re.IGNORECASE)
     without_styles = re.sub(r"<style[\s\S]*?</style>", " ", without_scripts, flags=re.IGNORECASE)
     without_tags = re.sub(r"<[^>]+>", " ", without_styles)
     return re.sub(r"\s+", " ", html.unescape(without_tags)).strip()
+
+
+def normalize_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def story_url_for_path(story_path: str) -> str:
+    normalized = story_path if story_path.startswith("/") else f"/{story_path}"
+    return f"{TRADINGVIEW_WEB_HOST}{normalized}"
+
+
+def published_iso(value: Any) -> str | None:
+    if not isinstance(value, (int, float)):
+        return None
+    return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
+
+
+def fetch_story_content(story_path: str, options: ScannerOptions | None = None) -> dict[str, Any]:
+    if not story_path:
+        return {}
+    url = story_url_for_path(story_path)
+    html_body = fetch_text(url, options=options)
+    title_match = re.search(r"<title>([^<]+)</title>", html_body, flags=re.IGNORECASE)
+    body_match = re.search(r"<article[^>]*>(.+?)</article>", html_body, flags=re.IGNORECASE | re.DOTALL)
+    if not body_match:
+        body_match = re.search(r'data-name="news-content"[^>]*>(.+?)</div>\s*</div>', html_body, flags=re.IGNORECASE | re.DOTALL)
+    title = normalize_text(title_match.group(1)) if title_match else None
+    body = strip_html(body_match.group(1)) if body_match else None
+    return {
+        "url": url,
+        "title": title or None,
+        "body": body or None,
+    }
+
+
+def parse_groq_status_error(error: Any) -> str:
+    status = getattr(error, "status_code", None)
+    response = getattr(error, "response", None)
+    payload = None
+    if response is not None:
+        try:
+            payload = response.json()
+        except Exception:
+            try:
+                payload = json.loads(getattr(response, "text", "") or "")
+            except Exception:
+                payload = None
+    info = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(info, dict):
+        code = normalize_text(info.get("code", ""))
+        message = normalize_text(info.get("message", ""))
+        error_code = normalize_text(info.get("error_code", ""))
+        title = normalize_text(info.get("title", ""))
+        if str(status) == "403" and error_code == "1010":
+            return "Groq HTTP 403: Cloudflare blocked this request signature (Error 1010)."
+        if str(status) == "403" and title:
+            return f"Groq HTTP 403: {title}{f' — {message}' if message else ''}"
+        detail = " — ".join(part for part in [code, message] if part)
+        return f"Groq HTTP {status}: {detail}" if detail else f"Groq HTTP {status}"
+    if status:
+        return f"Groq HTTP {status}: {error}"
+    return f"Groq request failed: {error}"
 
 
 def parse_yahoo_quote(raw_quote: dict[str, Any]) -> Gapper | None:
@@ -349,11 +442,17 @@ def parse_yahoo_quote(raw_quote: dict[str, Any]) -> Gapper | None:
     if not symbol or price is None or gap_pct is None or premarket_volume is None:
         return None
 
+    exchange = str(raw_quote.get("exchange", ""))
+    tv_prefix = yahoo_exchange_to_tv(exchange)
+    tv_symbol = f"{tv_prefix}:{symbol}" if tv_prefix else str(symbol)
+
     return Gapper(
         symbol=str(symbol),
         price=price,
         gap_pct=gap_pct,
         premarket_volume=premarket_volume,
+        exchange=exchange,
+        tv_symbol=tv_symbol,
     )
 
 
@@ -408,29 +507,6 @@ def fetch_yahoo_gainers(options: ScannerOptions | None = None) -> list[Gapper]:
             errors.append(f"{url}: {error}")
             log_message(options, f"Yahoo screener endpoint failed: {url} ({error})")
 
-    log_message(options, "Yahoo JSON endpoints failed; trying rendered Yahoo page fallback")
-    html_body = crawl4ai_fetch_text(YAHOO_GAINERS_PAGE_URL, options)
-    if html_body:
-        parsed = parse_yahoo_gainers_from_html(html_body)
-        if parsed:
-            filtered = sorted(
-                (
-                    quote
-                    for quote in parsed
-                    if quote.gap_pct > criteria["min_gap_pct"]
-                    and quote.price > criteria["min_price"]
-                    and quote.premarket_volume > criteria["min_premarket_volume"]
-                ),
-                key=lambda quote: quote.gap_pct,
-                reverse=True,
-            )[: int(criteria["max_results"])]
-            log_message(
-                options,
-                f"Yahoo HTML fallback parsed {len(parsed)} quotes, kept {len(filtered)}: "
-                f"{', '.join(quote.symbol for quote in filtered) or 'none'}",
-            )
-            return filtered
-
     raise RuntimeError(f"Yahoo gainers source failed ({'; '.join(errors)})")
 
 
@@ -466,62 +542,322 @@ def parse_yahoo_gainers_from_html(page_html: str) -> list[Gapper]:
     return gappers
 
 
-def extract_headlines(page_html: str, symbol: str) -> list[str]:
-    text = strip_html(page_html)
-    sentences = [
-        sentence.strip()
-        for sentence in re.split(r"(?<=[.!?])\s+", text)
-        if 20 < len(sentence.strip()) < 220
-    ]
-    symbol_pattern = re.compile(rf"\b{re.escape(symbol)}\b", re.IGNORECASE)
-    market_keywords = re.compile(
-        r"stock|shares|trading|price|analyst|earnings|revenue|guidance|upgrade|downgrade|"
-        r"FDA|merger|acquisition|offering|contract|partnership|approval|results",
-        re.IGNORECASE,
+def extract_escaped_json_array(page_html: str, key: str) -> list[dict[str, Any]]:
+    needle = f'\\"{key}\\":['
+    start_search = 0
+    best: list[dict[str, Any]] = []
+
+    while True:
+        found = page_html.find(needle, start_search)
+        if found == -1:
+            break
+        start = found + len(f'\\"{key}\\":')
+        depth = 0
+        in_string = False
+        escaped = False
+        end = None
+
+        for index in range(start, len(page_html)):
+            char = page_html[index]
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if char == "[":
+                depth += 1
+            elif char == "]":
+                depth -= 1
+                if depth == 0:
+                    end = index + 1
+                    break
+
+        if end is not None:
+            raw = page_html[start:end]
+            try:
+                decoded = raw.encode("utf-8").decode("unicode_escape").replace('\\"', '"').replace('\\/', '/')
+                parsed = json.loads(decoded)
+                if isinstance(parsed, list):
+                    candidates = [item for item in parsed if isinstance(item, dict) and item.get("title")]
+                    if len(candidates) > len(best):
+                        best = candidates
+            except Exception:
+                pass
+        start_search = found + len(needle)
+
+    return best
+
+
+def fetch_symbol_news(symbol: str, tv_symbol: str | None = None, options: ScannerOptions | None = None) -> dict[str, Any]:
+    query_symbol = tv_symbol or symbol
+    url = (
+        f"{TRADINGVIEW_NEWS_HOST}/v2/headlines?"
+        f"symbol={urllib.parse.quote(query_symbol)}&client=web&lang=en"
     )
-
-    candidates = [sentence for sentence in sentences if symbol_pattern.search(sentence) or market_keywords.search(sentence)]
-    deduped = list(dict.fromkeys(candidates))
-    return deduped[:2]
-
-
-def extract_catalyst(headlines: list[str], symbol: str) -> str | None:
-    if not headlines:
-        return None
-
-    first = re.sub(r"\s+", " ", headlines[0]).strip()
-    if not first:
-        return None
-
-    return first if symbol in first else f"{symbol}: {first}"
-
-
-def fetch_catalyst(symbol: str, options: ScannerOptions | None = None) -> dict[str, Any]:
+    log_message(options, f"fetching TradingView news for {symbol} ({query_symbol}): {url}")
     try:
-        quote_url = benzinga_quote_url(symbol)
-        log_message(options, f"loading Benzinga catalyst page for {symbol}: {quote_url}")
-        page_html = fetch_text(
-            quote_url,
-            headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
-            options=options,
-        )
-        if "Just a moment" in page_html or "enable JavaScript" in page_html:
-            log_message(options, f"Benzinga page for {symbol} appears browser-gated; trying Crawl4AI")
-            page_html = crawl4ai_fetch_text(quote_url, options) or page_html
-        headlines = extract_headlines(page_html, symbol)
-        catalyst = extract_catalyst(headlines, symbol)
-        log_message(
-            options,
-            f"catalyst lookup for {symbol}: {len(headlines)} headline(s), "
-            f"catalyst={'found' if catalyst else 'not found'}",
-        )
+        body = fetch_text(url, headers={"Accept": "application/json"}, options=options)
+        data = json.loads(body)
+        news_items = data.get("items", [])
+        if not news_items:
+            raise RuntimeError("TradingView news returned no items")
+
+        sorted_items = sorted(news_items, key=lambda item: item.get("urgency", 0), reverse=True)
+        headlines = []
+        details = []
+        news_items_payload = []
+        for item in sorted_items[:3]:
+            title = normalize_text(item.get("title", ""))
+            if not title:
+                continue
+            source = normalize_text(item.get("source", ""))
+            provider = normalize_text(item.get("provider", ""))
+            story_path = normalize_text(item.get("storyPath", ""))
+            published = published_iso(item.get("published"))
+            link = normalize_text(item.get("link", ""))
+            teaser = f"Source: {source}" if source else ""
+            story = {}
+            if story_path:
+                try:
+                    story = fetch_story_content(story_path, options)
+                except Exception as error:
+                    log_message(options, f"story fetch failed for {symbol} {story_path}: {error}")
+            headlines.append(title)
+            details.append({
+                "title": title,
+                "teaser": teaser,
+                "body": normalize_text(story.get("body", "")) if story.get("body") else "",
+            })
+            news_items_payload.append({
+                "title": title,
+                "body": story.get("body"),
+                "url": link or story.get("url") or None,
+                "story_url": story.get("url") or None,
+                "source": source or None,
+                "provider": provider or None,
+                "published": published,
+                "story_path": story_path or None,
+            })
+        if not headlines:
+            raise RuntimeError("TradingView news had items but no usable titles")
+        source_url = f"https://www.tradingview.com/symbols/{urllib.parse.quote(query_symbol.replace(':', '-'))}/news/"
+        return {"headlines": headlines, "details": details, "news_items": news_items_payload, "source_url": source_url}
+    except (OSError, urllib.error.URLError, urllib.error.HTTPError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"TradingView news fetch failed: {error}") from error
+
+
+def summarize_catalyst_with_groq(symbol: str, details: list[dict[str, str]], options: ScannerOptions | None = None) -> str:
+    api_key = read_env_value("GROQ_API_KEY")
+    model = read_env_value("GROQ_MODEL") or "openai/gpt-oss-120b"
+    if not api_key:
+        raise RuntimeError("Groq API key missing (GROQ_API_KEY)")
+    if not details:
+        raise RuntimeError("No news headlines available for Groq summarization")
+
+    try:
+        groq_module = importlib.import_module("groq")
+        groq_client = getattr(groq_module, "Groq")
+        rate_limit_error = getattr(groq_module, "RateLimitError")
+        connection_error = getattr(groq_module, "APIConnectionError")
+        status_error = getattr(groq_module, "APIStatusError")
+    except Exception as error:
+        raise RuntimeError("Groq Python SDK is not installed. Run `python3 -m pip install groq`.") from error
+
+    prompt_lines = [
+        f"What recent news or catalyst is driving {symbol} stock today?",
+        "",
+        "Use only the news items below.",
+        "Return JSON with exactly one key: catalyst.",
+        "The catalyst must be one sentence only, no commentary, no bullets.",
+        "",
+        "News items:",
+    ]
+    max_body_chars = 100_000
+    for index, item in enumerate(details, start=1):
+        prompt_lines.append(f"{index}. Headline: {item['title']}")
+        if item.get("teaser"):
+            prompt_lines.append(f"   Teaser: {item['teaser']}")
+        body = item.get("body", "")
+        if body and max_body_chars > 0:
+            if len(body) <= max_body_chars:
+                prompt_lines.append(f"   Body: {body}")
+                max_body_chars -= len(body)
+            else:
+                prompt_lines.append(f"   Body: {body[:max_body_chars]}[...trimmed]")
+                max_body_chars = 0
+
+    client = groq_client(api_key=api_key, max_retries=0)
+    completion = None
+    for attempt in range(GROQ_MAX_RETRIES):
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                response_format={"type": "json_object"},
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You summarize stock news into one precise catalyst sentence. Respond only with valid JSON.",
+                    },
+                    {
+                        "role": "user",
+                        "content": "\n".join(prompt_lines),
+                    },
+                ],
+            )
+            break
+        except rate_limit_error as error:
+            if attempt >= GROQ_MAX_RETRIES - 1:
+                raise RuntimeError(f"Groq rate limit: exhausted {GROQ_MAX_RETRIES} retries — {error}") from error
+            wait = GROQ_RETRY_BASE_SECONDS * (2 ** attempt) + random.uniform(0.5, 2.0)
+            log_message(options, f"Groq 429 on {symbol}, retry {attempt + 2}/{GROQ_MAX_RETRIES} after {wait:.0f}s")
+            time.sleep(wait)
+        except connection_error as error:
+            raise RuntimeError(f"Groq connection failed: {error.__cause__ or error}") from error
+        except status_error as error:
+            raise RuntimeError(parse_groq_status_error(error)) from error
+        except Exception as error:
+            raise RuntimeError(f"Groq request failed: {error}") from error
+
+    if completion is None:
+        raise RuntimeError("Groq returned no completion after retries")
+
+    content = completion.choices[0].message.content or ""
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("Groq returned empty content")
+    cleaned = content.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"Groq returned invalid JSON: {error}") from error
+    catalyst = parsed.get("catalyst") if isinstance(parsed, dict) else None
+    if not isinstance(catalyst, str) or not catalyst.strip():
+        raise RuntimeError("Groq returned no catalyst text")
+    return re.sub(r"\s+", " ", catalyst).strip()
+
+
+def fetch_catalyst(symbol: str, tv_symbol: str | None = None, options: ScannerOptions | None = None) -> dict[str, Any]:
+    news = fetch_symbol_news(symbol, tv_symbol, options)
+    headlines = news["headlines"]
+    try:
+        catalyst = summarize_catalyst_with_groq(symbol, news["details"], options)
+        log_message(options, f"tradingview+groq for {symbol}: {len(headlines)} headline(s), catalyst=found")
         return {
             "catalyst": catalyst,
             "headlines": headlines,
+            "news_items": news.get("news_items", []),
+            "catalyst_method": "tradingview-groq",
+            "catalyst_error": None,
+            "news_url": news["source_url"],
         }
-    except (OSError, urllib.error.URLError, urllib.error.HTTPError, RuntimeError) as error:
-        log_message(options, f"catalyst lookup failed for {symbol}: {error}")
-        return {"catalyst": None, "headlines": []}
+    except RuntimeError as error:
+        log_message(options, f"groq catalyst lookup failed for {symbol}: {error}")
+        return {
+            "catalyst": None,
+            "headlines": headlines,
+            "news_items": news.get("news_items", []),
+            "catalyst_method": "error",
+            "catalyst_error": str(error),
+            "news_url": news["source_url"],
+        }
+
+
+def enrichment_config() -> dict[str, Any]:
+    raw = load_scanner_config().get("enrichment", {}).get("tradingView", {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def enrichment_columns() -> list[str]:
+    configured = enrichment_config().get("columns")
+    if isinstance(configured, list) and configured:
+        return [str(col) for col in configured if isinstance(col, str) and col.strip()]
+    return list(DEFAULT_TV_ENRICHMENT_COLUMNS)
+
+
+def enrichment_enabled() -> bool:
+    return bool(enrichment_config().get("enabled", True))
+
+
+def enrichment_market() -> str:
+    return str(enrichment_config().get("market", "global"))
+
+
+def post_scanner_json(
+    symbols: list[str],
+    columns: list[str],
+    market: str,
+    options: ScannerOptions | None = None,
+) -> dict[str, Any]:
+    payload = json.dumps(
+        {
+            "symbols": {"tickers": symbols},
+            "columns": columns,
+            "range": [0, len(symbols)],
+            "filter": [],
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{TRADINGVIEW_SCANNER_HOST}/{market}/scan",
+        data=payload,
+        method="POST",
+        headers={
+            **build_headers(),
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+        return json.loads(response.read().decode("utf-8", errors="replace"))
+
+
+def enrich_with_tradingview(
+    gappers: list[dict[str, Any]],
+    options: ScannerOptions | None = None,
+) -> dict[str, dict[str, Any]]:
+    if not enrichment_enabled():
+        log_message(options, "tradingview enrichment disabled by config")
+        return {}
+
+    symbols = [str(g["tv_symbol"]) for g in gappers if g.get("tv_symbol")]
+    if not symbols:
+        log_message(options, "tradingview enrichment skipped: no tv_symbol candidates")
+        return {}
+
+    columns = enrichment_columns()
+    market = enrichment_market()
+    log_message(
+        options,
+        f"tradingview enrichment: {len(symbols)} symbol(s), market={market}, cols={len(columns)}",
+    )
+
+    try:
+        raw = post_scanner_json(symbols, columns, market, options)
+    except (OSError, urllib.error.URLError, urllib.error.HTTPError, ValueError) as error:
+        log_message(options, f"tradingview enrichment POST failed: {error}")
+        return {}
+
+    rows = raw.get("data") if isinstance(raw, dict) else None
+    if not isinstance(rows, list):
+        log_message(options, f"tradingview enrichment: unexpected payload shape (keys={list(raw.keys()) if isinstance(raw, dict) else type(raw).__name__})")
+        return {}
+
+    enriched: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        symbol = row.get("s") if isinstance(row, dict) else None
+        values = row.get("d") if isinstance(row, dict) else None
+        if not symbol or not isinstance(values, list):
+            continue
+        fields = {col: val for col, val in zip(columns, values)}
+        enriched[str(symbol)] = fields
+    log_message(options, f"tradingview enrichment: resolved {len(enriched)}/{len(symbols)} symbol(s)")
+    return enriched
 
 
 def format_percent(value: float) -> str:
@@ -531,7 +867,7 @@ def format_percent(value: float) -> str:
 
 def format_summary(gappers: list[dict[str, Any]]) -> str:
     top = [
-        f"{gapper['symbol']} ({format_percent(gapper['gap_pct'])}) — {gapper['catalyst'] or 'no catalyst found'}"
+        f"{gapper['symbol']} ({format_percent(gapper['gap_pct'])}) — {gapper['catalyst'] or ('ERROR: ' + gapper['catalyst_error'] if gapper.get('catalyst_error') else 'no catalyst found')}"
         for gapper in gappers[:3]
     ]
     return f"Premarket Gappers: {len(gappers)} names. Top: {', '.join(top)}"
@@ -556,16 +892,29 @@ def main(argv: list[str] | None = None) -> int:
         log_message(options, f"fetching catalysts for {len(filtered)} symbol(s)")
 
         with ThreadPoolExecutor(max_workers=CATALYST_WORKERS) as executor:
-            futures = {executor.submit(fetch_catalyst, gapper.symbol, options): gapper for gapper in filtered}
+            futures = {executor.submit(fetch_catalyst, gapper.symbol, gapper.tv_symbol, options): gapper for gapper in filtered}
             for future in as_completed(futures):
                 gapper = futures[future]
                 try:
                     enriched_by_symbol[gapper.symbol] = future.result()
-                except Exception:
-                    log_message(options, f"unexpected catalyst worker error for {gapper.symbol}")
-                    enriched_by_symbol[gapper.symbol] = {"catalyst": None, "headlines": []}
+                except Exception as error:
+                    log_message(options, f"unexpected catalyst worker error for {gapper.symbol}: {error}")
+                    enriched_by_symbol[gapper.symbol] = {
+                        "catalyst": None,
+                        "headlines": [],
+                        "catalyst_method": "error",
+                        "catalyst_error": str(error),
+                        "news_url": None,
+                    }
 
         enriched = []
+        tv_fields_by_symbol = enrich_with_tradingview(
+            [
+                {"tv_symbol": gapper.tv_symbol, "symbol": gapper.symbol}
+                for gapper in filtered
+            ],
+            options,
+        )
         for index, gapper in enumerate(filtered, start=1):
             catalyst = enriched_by_symbol.get(gapper.symbol, {"catalyst": None, "headlines": []})
             enriched.append(
@@ -575,8 +924,15 @@ def main(argv: list[str] | None = None) -> int:
                     "price": gapper.price,
                     "gap_pct": gapper.gap_pct,
                     "premarket_volume": gapper.premarket_volume,
+                    "exchange": gapper.exchange,
+                    "tv_symbol": gapper.tv_symbol,
                     "catalyst": catalyst["catalyst"],
                     "headlines": catalyst["headlines"],
+                    "news_items": catalyst.get("news_items", []),
+                    "catalyst_method": catalyst.get("catalyst_method"),
+                    "catalyst_error": catalyst.get("catalyst_error"),
+                    "news_url": catalyst.get("news_url"),
+                    "tv_enrichment": tv_fields_by_symbol.get(gapper.tv_symbol),
                 }
             )
 
