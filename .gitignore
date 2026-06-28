@@ -29,6 +29,7 @@ tradingview-mcp/
 .cache/
 data/*.db
 data/*.db-*
+data/*.db.bak-*
 premarket_gappers_*.json
 tjl_watchlist_*.json
 logs/
@@ -55,3 +56,5 @@ yarn-debug.log*
 .DS_Store
 *.swp
 *.swo
+
+.playwright-mcp/

@@ -14,5 +14,21 @@
   "data": {
     "watchlistPath": "data/watchlist.json",
     "databasePath": "data/bot-trader.db"
+  },
+  "enrichment": {
+    "tradingView": {
+      "enabled": true,
+      "market": "global",
+      "columns": [
+        "change_from_open",
+        "Recommend.All",
+        "market_cap_basic",
+        "sector",
+        "industry",
+        "RSI",
+        "Perf.W",
+        "price_52_week_high"
+      ]
+    }
   }
 }
