@@ -7,6 +7,14 @@
       "cwd": "/Users/ed/Projects/bot-trader/tradingview-mcp",
       "enabled": true,
       "timeout": 30000
+    },
+    "tavily": {
+      "type": "local",
+      "command": ["npx", "-y", "tavily-mcp@latest"],
+      "enabled": true,
+      "environment": {
+        "TAVILY_API_KEY": "{env:TAVILY_API_KEY}"
+      }
     }
   }
 }
