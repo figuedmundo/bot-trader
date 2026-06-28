@@ -86,7 +86,7 @@ def daily_bars(current: datetime) -> list[dict[str, Any]]:
     return bars
 
 
-def minute_bars(current: datetime) -> list[dict[str, Any]]:
+def intraday_bars(current: datetime) -> list[dict[str, Any]]:
     today = current.date()
     return [
         {"time": datetime.combine(today, datetime.min.time(), tzinfo=NEW_YORK).replace(hour=4, minute=15).isoformat(), "high": 118},
@@ -96,23 +96,34 @@ def minute_bars(current: datetime) -> list[dict[str, Any]]:
     ]
 
 
-def symbol_payload(symbol: str, current: datetime, price: float) -> dict[str, Any]:
+def symbol_payload(symbol: str, current: datetime, price: float, intraday_timeframe: str = "1") -> dict[str, Any]:
     return {
         "symbol": symbol,
         "quote": {"price": price},
         "daily_bars": daily_bars(current),
-        "minute_bars": minute_bars(current),
+        "intraday_bars": intraday_bars(current),
+        "intraday_timeframe": intraday_timeframe,
     }
 
 
 class TrendJoinLongScannerTests(unittest.TestCase):
+    def test_normalize_intraday_timeframe_supports_aliases_and_rejects_4h(self) -> None:
+        scanner = load_scanner_module()
+
+        self.assertEqual(scanner.normalize_intraday_timeframe("1"), "1")
+        self.assertEqual(scanner.normalize_intraday_timeframe("15m"), "15")
+        self.assertEqual(scanner.normalize_intraday_timeframe("1h"), "60")
+
+        with self.assertRaisesRegex(ValueError, "too coarse"):
+            scanner.normalize_intraday_timeframe("4h")
+
     def test_evaluate_symbol_pass_and_failure_modes(self) -> None:
         scanner = load_scanner_module()
         current = datetime(2026, 6, 24, 10, 30, tzinfo=NEW_YORK)
 
-        passing = scanner.evaluate_symbol(symbol_payload("AMD", current, 125), current)
-        fail_intraday = scanner.evaluate_symbol(symbol_payload("NVDA", current, 123), current)
-        fail_daily = scanner.evaluate_symbol(symbol_payload("MU", current, 119), current)
+        passing = scanner.evaluate_symbol(symbol_payload("AMD", current, 125), current, "1")
+        fail_intraday = scanner.evaluate_symbol(symbol_payload("NVDA", current, 123), current, "1")
+        fail_daily = scanner.evaluate_symbol(symbol_payload("MU", current, 119), current, "1")
 
         self.assertEqual(passing["result"], "PASS")
         self.assertEqual(fail_intraday["result"], "fail_intraday")
@@ -120,7 +131,71 @@ class TrendJoinLongScannerTests(unittest.TestCase):
         self.assertEqual(passing["prev_daily_high"], 120)
         self.assertLess(passing["sma200"], passing["prev_daily_close"])
 
-    def test_time_gate_error_json_exits_cleanly(self) -> None:
+    def test_scan_collection_rejects_intraday_timeframe_mismatch(self) -> None:
+        scanner = load_scanner_module()
+        current = datetime(2026, 6, 24, 10, 30, tzinfo=NEW_YORK)
+
+        payload = {
+            "intraday_timeframe": "15",
+            "symbols": [
+                symbol_payload("AMD", current, 125, intraday_timeframe="15"),
+                symbol_payload("NVDA", current, 123, intraday_timeframe="15"),
+                symbol_payload("MU", current, 119, intraday_timeframe="15"),
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, "input declares intraday timeframe 15"):
+            scanner.scan_collection(payload, current, "1")
+
+    def test_symbols_from_payload_drives_dynamic_scan_universe(self) -> None:
+        scanner = load_scanner_module()
+        current = datetime(2026, 6, 24, 10, 30, tzinfo=NEW_YORK)
+
+        payload = {
+            "intraday_timeframe": "15",
+            "symbols": [
+                symbol_payload("TSLA", current, 125, intraday_timeframe="15"),
+                symbol_payload("PLTR", current, 123, intraday_timeframe="15"),
+            ],
+        }
+
+        self.assertEqual(scanner.symbols_from_payload(payload), ["TSLA", "PLTR"])
+
+        results = scanner.scan_collection(payload, current, "15")
+
+        self.assertEqual([result["symbol"] for result in results], ["TSLA", "PLTR"])
+
+    def test_scan_collection_requires_declared_timeframe_for_non_default_mode(self) -> None:
+        scanner = load_scanner_module()
+        current = datetime(2026, 6, 24, 10, 30, tzinfo=NEW_YORK)
+
+        payload = {
+            "symbols": [
+                {
+                    "symbol": "AMD",
+                    "quote": {"price": 125},
+                    "daily_bars": daily_bars(current),
+                    "intraday_bars": intraday_bars(current),
+                },
+                {
+                    "symbol": "NVDA",
+                    "quote": {"price": 123},
+                    "daily_bars": daily_bars(current),
+                    "intraday_bars": intraday_bars(current),
+                },
+                {
+                    "symbol": "MU",
+                    "quote": {"price": 119},
+                    "daily_bars": daily_bars(current),
+                    "intraday_bars": intraday_bars(current),
+                },
+            ]
+        }
+
+        with self.assertRaisesRegex(ValueError, "must declare intraday_timeframe"):
+            scanner.scan_collection(payload, current, "15")
+
+    def test_missing_input_writes_error_json_and_exits_nonzero(self) -> None:
         scanner = load_scanner_module()
 
         with TemporaryDirectory() as temp_dir:
@@ -140,10 +215,12 @@ class TrendJoinLongScannerTests(unittest.TestCase):
                 scanner.database_path = original_database_path
                 scanner.output_path_for_now = original_output_path_for_now
 
-            self.assertEqual(exit_code, 0)
+            self.assertEqual(exit_code, 1)
             artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+            self.assertEqual(artifact["timeframes"], {"daily": "D", "intraday": "1"})
             self.assertEqual(artifact["status"], "error")
             self.assertEqual(artifact["hits"], [])
+            self.assertIn("--input is required", artifact["error"])
 
             with closing(sqlite3.connect(db_path)) as connection:
                 connection.row_factory = sqlite3.Row
@@ -151,7 +228,7 @@ class TrendJoinLongScannerTests(unittest.TestCase):
 
             self.assertEqual(run["scanner_name"], "trend-join-long-scan")
             self.assertEqual(run["status"], "error")
-            self.assertIn("10:00", run["error_message"])
+            self.assertIn("--input is required", run["error_message"])
 
     def test_today_hod_includes_latest_completed_bar_before_now(self) -> None:
         scanner = load_scanner_module()
@@ -192,6 +269,7 @@ class TrendJoinLongScannerTests(unittest.TestCase):
                 },
             ],
             current,
+            "1",
         )
 
         self.assertEqual(levels["pmh"], 120)
@@ -233,6 +311,7 @@ class TrendJoinLongScannerTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+            self.assertEqual(artifact["timeframes"], {"daily": "D", "intraday": "1"})
             self.assertEqual(artifact["candidates_checked"], 3)
             self.assertEqual([hit["symbol"] for hit in artifact["hits"]], ["AMD"])
             self.assertEqual(
@@ -266,9 +345,66 @@ class TrendJoinLongScannerTests(unittest.TestCase):
             self.assertEqual(results[0]["timeframe"], "D,1")
             metadata = json.loads(results[0]["metadata"])
             self.assertEqual(metadata["result"], "PASS")
+            self.assertEqual(metadata["timeframes"], {"daily": "D", "intraday": "1"})
             self.assertEqual(metadata["artifact_path"], str(artifact_path))
 
-    def test_allow_outside_hours_runs_full_scan_for_development(self) -> None:
+    def test_main_persists_selected_intraday_timeframe(self) -> None:
+        scanner = load_scanner_module()
+        current = datetime(2026, 6, 24, 10, 30, tzinfo=NEW_YORK)
+
+        with TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            db_path = temp_path / "bot-trader.db"
+            input_path = temp_path / "tjl-input.json"
+            artifact_path = temp_path / "tjl_watchlist_2026-06-24_1030ET.json"
+            create_schema(db_path)
+            input_path.write_text(
+                json.dumps(
+                    {
+                        "intraday_timeframe": "15",
+                        "symbols": [
+                            symbol_payload("AMD", current, 125, intraday_timeframe="15"),
+                            symbol_payload("NVDA", current, 123, intraday_timeframe="15"),
+                            symbol_payload("MU", current, 119, intraday_timeframe="15"),
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            original_database_path = scanner.database_path
+            original_output_path_for_now = scanner.output_path_for_now
+            scanner.database_path = lambda: db_path
+            scanner.output_path_for_now = lambda current=None: artifact_path
+
+            try:
+                exit_code = scanner.main(
+                    [
+                        "--input",
+                        str(input_path),
+                        "--intraday-timeframe",
+                        "15",
+                        "--now",
+                        "2026-06-24T10:30:00-04:00",
+                    ]
+                )
+            finally:
+                scanner.database_path = original_database_path
+                scanner.output_path_for_now = original_output_path_for_now
+
+            self.assertEqual(exit_code, 0)
+            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+            self.assertEqual(artifact["timeframes"], {"daily": "D", "intraday": "15"})
+
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.row_factory = sqlite3.Row
+                result = connection.execute("SELECT * FROM scan_results ORDER BY id").fetchone()
+
+            self.assertEqual(result["timeframe"], "D,15")
+            metadata = json.loads(result["metadata"])
+            self.assertEqual(metadata["timeframes"], {"daily": "D", "intraday": "15"})
+
+    def test_scanner_runs_outside_trading_hours_without_special_flag(self) -> None:
         scanner = load_scanner_module()
         current = datetime(2026, 6, 24, 20, 30, tzinfo=NEW_YORK)
 
@@ -303,7 +439,6 @@ class TrendJoinLongScannerTests(unittest.TestCase):
                         str(input_path),
                         "--now",
                         "2026-06-24T20:30:00-04:00",
-                        "--allow-outside-hours",
                     ]
                 )
             finally:
@@ -312,7 +447,6 @@ class TrendJoinLongScannerTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
-            self.assertTrue(artifact["time_gate_overridden"])
             self.assertEqual([hit["symbol"] for hit in artifact["hits"]], ["AMD"])
 
             with closing(sqlite3.connect(db_path)) as connection:

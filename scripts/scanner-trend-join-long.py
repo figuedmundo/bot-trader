@@ -28,8 +28,23 @@ SCANNER_NAME = "trend-join-long-scan"
 TEST_UNIVERSE = ["AMD", "NVDA", "MU"]
 MARKET_OPEN = time(9, 30)
 PREMARKET_START = time(4, 0)
-TIME_GATE_START = time(10, 0)
-TIME_GATE_END = time(15, 30)
+DEFAULT_INTRADAY_TIMEFRAME = "1"
+SUPPORTED_INTRADAY_TIMEFRAMES = ("1", "5", "10", "15", "30", "60")
+EXPERIMENTAL_INTRADAY_TIMEFRAMES = ("30", "60")
+INTRADAY_TIMEFRAME_ALIASES = {
+    "1m": "1",
+    "5m": "5",
+    "10m": "10",
+    "15m": "15",
+    "30m": "30",
+    "60m": "60",
+    "1h": "60",
+    "1hr": "60",
+    "1hour": "60",
+    "4h": "240",
+    "4hr": "240",
+    "4hour": "240",
+}
 
 
 @dataclass(frozen=True)
@@ -37,7 +52,7 @@ class ScannerOptions:
     input_path: Path | None = None
     log: bool = False
     now: datetime | None = None
-    allow_outside_hours: bool = False
+    intraday_timeframe: str = DEFAULT_INTRADAY_TIMEFRAME
 
 
 def parse_args(argv: list[str] | None = None) -> ScannerOptions:
@@ -63,17 +78,21 @@ def parse_args(argv: list[str] | None = None) -> ScannerOptions:
         help="Override current time for tests, as an ISO datetime. Naive values are interpreted as ET.",
     )
     parser.add_argument(
-        "--allow-outside-hours",
-        dest="allow_outside_hours",
-        action="store_true",
-        help="Development-only override that evaluates input data outside the 10:00-15:30 ET time gate.",
+        "--intraday-timeframe",
+        dest="intraday_timeframe",
+        default=DEFAULT_INTRADAY_TIMEFRAME,
+        type=parse_intraday_timeframe_arg,
+        help=(
+            "Intraday bar timeframe in minutes. Supported: 1, 5, 10, 15. Experimental: 30, 60. "
+            "4-hour bars are intentionally rejected for this scanner."
+        ),
     )
     args = parser.parse_args(argv)
     return ScannerOptions(
         input_path=args.input_path,
         log=args.log,
         now=parse_datetime(args.now) if args.now else None,
-        allow_outside_hours=args.allow_outside_hours,
+        intraday_timeframe=args.intraday_timeframe,
     )
 
 
@@ -119,19 +138,89 @@ def database_path() -> Path:
     return path if path.is_absolute() else ROOT_DIR / path
 
 
-def watchlist_snapshot() -> list[str]:
+def default_test_universe() -> list[str]:
     return list(TEST_UNIVERSE)
 
 
-def criteria_snapshot() -> dict[str, Any]:
+def timeframes_snapshot(intraday_timeframe: str) -> dict[str, str]:
+    return {
+        "daily": "D",
+        "intraday": intraday_timeframe,
+    }
+
+
+def criteria_snapshot(intraday_timeframe: str, symbols: list[str]) -> dict[str, Any]:
     return {
         "dailyBreakout": "curr_px > prev_completed_daily_high and prev_daily_close > sma200",
         "intradayBreakout": "curr_px > premarket_high and curr_px > today_high_of_day_excluding_current_bar",
-        "timeGate": "10:00-15:30 America/New_York",
         "dailyBarPolicy": "drop today's daily bar when present; use previous completed daily candle",
-        "outsideHoursOverride": "--allow-outside-hours is development-only and must not be used for live scans",
-        "symbols": TEST_UNIVERSE,
+        "executionTiming": "schedule execution externally (cron/OpenCode automation); the scanner evaluates whenever invoked",
+        "timeframes": timeframes_snapshot(intraday_timeframe),
+        "supportedIntradayTimeframes": list(SUPPORTED_INTRADAY_TIMEFRAMES),
+        "experimentalIntradayTimeframes": list(EXPERIMENTAL_INTRADAY_TIMEFRAMES),
+        "symbols": symbols,
     }
+
+
+def normalize_intraday_timeframe(value: Any) -> str:
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if not numeric.is_integer():
+            raise ValueError("intraday timeframe must be a whole number of minutes")
+        text = str(int(numeric))
+    elif isinstance(value, str):
+        text = value.strip().lower()
+    else:
+        raise ValueError(f"unsupported intraday timeframe value: {value!r}")
+
+    normalized = INTRADAY_TIMEFRAME_ALIASES.get(text, text)
+    if normalized == "240":
+        raise ValueError(
+            "4-hour bars are too coarse for the Trend Join Long intraday scanner; "
+            "choose 1, 5, 10, 15, 30, or 60 minutes instead"
+        )
+    if normalized not in SUPPORTED_INTRADAY_TIMEFRAMES:
+        supported = ", ".join(SUPPORTED_INTRADAY_TIMEFRAMES)
+        raise ValueError(f"unsupported intraday timeframe {value!r}; choose one of: {supported}")
+    return normalized
+
+
+def parse_intraday_timeframe_arg(value: str) -> str:
+    try:
+        return normalize_intraday_timeframe(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def declared_intraday_timeframe(payload: dict[str, Any]) -> str | None:
+    for key in ("intraday_timeframe", "intradayTimeframe"):
+        if key not in payload:
+            continue
+        value = payload.get(key)
+        if value in (None, ""):
+            continue
+        return normalize_intraday_timeframe(value)
+    return None
+
+
+def require_declared_intraday_timeframe(payload: dict[str, Any], intraday_timeframe: str) -> str | None:
+    declared = declared_intraday_timeframe(payload)
+    if intraday_timeframe != DEFAULT_INTRADAY_TIMEFRAME and declared is None:
+        raise ValueError(
+            "input payload must declare intraday_timeframe when running with "
+            f"--intraday-timeframe {intraday_timeframe}"
+        )
+    return declared
+
+
+def symbols_from_payload(payload: dict[str, Any]) -> list[str]:
+    normalized = normalize_symbol_payloads(payload)
+    symbols: list[str] = []
+    for item in normalized:
+        symbol = str(item.get("symbol", "")).strip().upper()
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+    return symbols or default_test_universe()
 
 
 def parse_datetime(value: Any) -> datetime:
@@ -219,13 +308,17 @@ def daily_levels(daily_bars: list[dict[str, Any]], current: datetime) -> dict[st
     }
 
 
-def intraday_levels(minute_bars: list[dict[str, Any]], current: datetime) -> dict[str, float]:
+def intraday_levels(
+    intraday_bars: list[dict[str, Any]],
+    current: datetime,
+    intraday_timeframe: str,
+) -> dict[str, float]:
     current_et = normalize_now(current)
     today = current_et.date()
     premarket_highs: list[float] = []
     regular_highs: list[float] = []
 
-    for bar in minute_bars:
+    for bar in intraday_bars:
         observed_at = bar_time(bar).astimezone(NEW_YORK)
         if observed_at.date() != today:
             continue
@@ -236,9 +329,9 @@ def intraday_levels(minute_bars: list[dict[str, Any]], current: datetime) -> dic
             regular_highs.append(bar_value(bar, "high"))
 
     if not premarket_highs:
-        raise ValueError("missing premarket 1-minute bars for 04:00-09:30 ET")
+        raise ValueError(f"missing premarket {intraday_timeframe}-minute bars for 04:00-09:30 ET")
     if not regular_highs:
-        raise ValueError("missing regular-session 1-minute bars before now")
+        raise ValueError(f"missing regular-session {intraday_timeframe}-minute bars before now")
 
     return {
         "pmh": max(premarket_highs),
@@ -261,23 +354,35 @@ def result_reason(result: str, metrics: dict[str, float]) -> str:
     )
 
 
-def evaluate_symbol(payload: dict[str, Any], current: datetime) -> dict[str, Any]:
+def evaluate_symbol(payload: dict[str, Any], current: datetime, intraday_timeframe: str) -> dict[str, Any]:
     symbol = str(payload.get("symbol", "")).strip().upper()
     if not symbol:
         raise ValueError("symbol payload missing symbol")
 
     daily_bars = payload.get("daily_bars") or payload.get("daily") or payload.get("daily_ohlcv")
-    minute_bars = payload.get("minute_bars") or payload.get("intraday") or payload.get("minute_ohlcv")
+    intraday_bars = (
+        payload.get("intraday_bars")
+        or payload.get("minute_bars")
+        or payload.get("intraday")
+        or payload.get("minute_ohlcv")
+    )
     if not isinstance(daily_bars, list):
         raise ValueError(f"{symbol}: daily_bars must be a list")
-    if not isinstance(minute_bars, list):
-        raise ValueError(f"{symbol}: minute_bars must be a list")
+    if not isinstance(intraday_bars, list):
+        raise ValueError(f"{symbol}: intraday_bars must be a list")
+
+    payload_intraday_timeframe = require_declared_intraday_timeframe(payload, intraday_timeframe)
+    if payload_intraday_timeframe and payload_intraday_timeframe != intraday_timeframe:
+        raise ValueError(
+            f"{symbol}: input declares intraday timeframe {payload_intraday_timeframe} "
+            f"but scanner is running with {intraday_timeframe}"
+        )
 
     curr_price = quote_price(payload.get("quote", payload.get("curr_price")))
     metrics = {
         "curr_price": curr_price,
         **daily_levels(daily_bars, current),
-        **intraday_levels(minute_bars, current),
+        **intraday_levels(intraday_bars, current, intraday_timeframe),
     }
     daily_breakout = metrics["curr_price"] > metrics["prev_daily_high"] and metrics["prev_daily_close"] > metrics["sma200"]
     intraday_breakout = metrics["curr_price"] > metrics["pmh"] and metrics["curr_price"] > metrics["today_hod"]
@@ -295,6 +400,7 @@ def evaluate_symbol(payload: dict[str, Any], current: datetime) -> dict[str, Any
         "reason": result_reason(result, metrics),
         "daily_breakout": daily_breakout,
         "intraday_breakout": intraday_breakout,
+        "intraday_timeframe": intraday_timeframe,
         **metrics,
     }
 
@@ -316,21 +422,29 @@ def load_collection(input_path: Path) -> dict[str, Any]:
     return json.loads(input_path.read_text(encoding="utf-8"))
 
 
-def scan_collection(payload: dict[str, Any], current: datetime) -> list[dict[str, Any]]:
+def scan_collection(payload: dict[str, Any], current: datetime, intraday_timeframe: str) -> list[dict[str, Any]]:
+    payload_intraday_timeframe = require_declared_intraday_timeframe(payload, intraday_timeframe)
+    if payload_intraday_timeframe and payload_intraday_timeframe != intraday_timeframe:
+        raise ValueError(
+            f"input declares intraday timeframe {payload_intraday_timeframe} "
+            f"but scanner is running with {intraday_timeframe}"
+        )
+
+    requested_symbols = symbols_from_payload(payload)
     by_symbol = {str(item.get("symbol", "")).upper(): item for item in normalize_symbol_payloads(payload)}
     results = []
-    for symbol in TEST_UNIVERSE:
+    for symbol in requested_symbols:
         if symbol not in by_symbol:
             raise ValueError(f"input missing collected data for {symbol}")
-        results.append(evaluate_symbol(by_symbol[symbol], current))
+        results.append(evaluate_symbol(by_symbol[symbol], current, intraday_timeframe))
     return results
 
 
 def output_payload(
     results: list[dict[str, Any]],
     current: datetime,
-    *,
-    time_gate_overridden: bool = False,
+    intraday_timeframe: str,
+    symbols: list[str],
 ) -> dict[str, Any]:
     hits = [
         {
@@ -346,8 +460,8 @@ def output_payload(
     ]
     return {
         "scanned_at": normalize_now(current).isoformat(),
-        "time_gate_overridden": time_gate_overridden,
-        "candidates_checked": len(TEST_UNIVERSE),
+        "timeframes": timeframes_snapshot(intraday_timeframe),
+        "candidates_checked": len(symbols),
         "hits": hits,
         "all_results": [
             {"symbol": result["symbol"], "result": result["result"], "reason": result["reason"]}
@@ -356,12 +470,13 @@ def output_payload(
     }
 
 
-def error_payload(message: str, current: datetime) -> dict[str, Any]:
+def error_payload(message: str, current: datetime, intraday_timeframe: str, symbols: list[str]) -> dict[str, Any]:
     return {
         "scanned_at": normalize_now(current).isoformat(),
+        "timeframes": timeframes_snapshot(intraday_timeframe),
         "status": "error",
         "error": message,
-        "candidates_checked": len(TEST_UNIVERSE),
+        "candidates_checked": len(symbols),
         "hits": [],
         "all_results": [],
     }
@@ -371,14 +486,11 @@ def write_json(payload: dict[str, Any], output_path: Path) -> None:
     output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
-def is_time_gate_open(current: datetime) -> bool:
-    current_time = normalize_now(current).time()
-    return TIME_GATE_START <= current_time <= TIME_GATE_END
-
-
 def persist_scan_run(
     results: list[dict[str, Any]],
     *,
+    symbols: list[str],
+    intraday_timeframe: str,
     status: str,
     error_message: str | None = None,
     db_path: Path | None = None,
@@ -398,8 +510,8 @@ def persist_scan_run(
                 """,
                 (
                     SCANNER_NAME,
-                    json.dumps(watchlist_snapshot(), separators=(",", ":")),
-                    json.dumps(criteria_snapshot(), separators=(",", ":")),
+                    json.dumps(symbols, separators=(",", ":")),
+                    json.dumps(criteria_snapshot(intraday_timeframe, symbols), separators=(",", ":")),
                     status,
                     error_message,
                 ),
@@ -419,6 +531,7 @@ def persist_scan_run(
                     "sma200": result["sma200"],
                     "pmh": result["pmh"],
                     "today_hod": result["today_hod"],
+                    "timeframes": timeframes_snapshot(intraday_timeframe),
                 }
                 if artifact_path:
                     metadata["artifact_path"] = str(artifact_path)
@@ -435,7 +548,7 @@ def persist_scan_run(
                         None,
                         None,
                         result["curr_price"],
-                        "D,1",
+                        f"D,{intraday_timeframe}",
                         json.dumps(metadata, separators=(",", ":")),
                     ),
                 )
@@ -453,34 +566,42 @@ def main(argv: list[str] | None = None) -> int:
     options = parse_args(argv)
     current = normalize_now(options.now)
     artifact_path = output_path_for_now(current)
+    symbols = default_test_universe()
     log_message(options, "starting Trend Join Long scan")
+    log_message(options, f"using intraday timeframe {options.intraday_timeframe}m")
+    if options.intraday_timeframe in EXPERIMENTAL_INTRADAY_TIMEFRAMES:
+        log_message(options, f"experimental intraday timeframe enabled: {options.intraday_timeframe}m")
 
     try:
-        time_gate_open = is_time_gate_open(current)
-        if not time_gate_open and not options.allow_outside_hours:
-            message = "Trend Join Long scanner only runs between 10:00 and 15:30 America/New_York"
-            write_json(error_payload(message, current), artifact_path)
-            persist_scan_run([], status="error", error_message=message, artifact_path=artifact_path)
-            print(f"Trend Join Long scan skipped: {message}")
-            return 0
-        if not time_gate_open:
-            log_message(options, "outside-hours development override enabled")
-
         if options.input_path is None:
             raise ValueError("--input is required; provide normalized TradingView MCP collection JSON")
 
         payload = load_collection(options.input_path)
-        results = scan_collection(payload, current)
-        write_json(output_payload(results, current, time_gate_overridden=not time_gate_open), artifact_path)
+        symbols = symbols_from_payload(payload)
+        results = scan_collection(payload, current, options.intraday_timeframe)
+        write_json(output_payload(results, current, options.intraday_timeframe, symbols), artifact_path)
         status = "success" if any(result["result"] == "PASS" for result in results) else "empty"
-        scan_run_id = persist_scan_run(results, status=status, artifact_path=artifact_path)
+        scan_run_id = persist_scan_run(
+            results,
+            symbols=symbols,
+            intraday_timeframe=options.intraday_timeframe,
+            status=status,
+            artifact_path=artifact_path,
+        )
         log_message(options, f"persisted scan_run_id={scan_run_id} to {database_path()}")
         print_result_lines(results)
         return 0
     except Exception as error:
-        write_json(error_payload(str(error), current), artifact_path)
+        write_json(error_payload(str(error), current, options.intraday_timeframe, symbols), artifact_path)
         try:
-            persist_scan_run([], status="error", error_message=str(error), artifact_path=artifact_path)
+            persist_scan_run(
+                [],
+                symbols=symbols,
+                intraday_timeframe=options.intraday_timeframe,
+                status="error",
+                error_message=str(error),
+                artifact_path=artifact_path,
+            )
         except Exception as db_error:
             log_message(options, f"failed to persist error scan: {db_error}")
         print(f"Trend Join Long scan failed: {error}", file=sys.stderr)
