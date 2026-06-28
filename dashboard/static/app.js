@@ -999,27 +999,39 @@ function renderLearnSection() {
       ]),
     },
     {
-      title: 'Your Workflow',
+      title: 'Your Trading Checklist',
       body: renderLearnWorkflow([
         {
-          label: 'Before market open (7:00–9:15 AM ET):',
-          text: 'Run the premarket scan. Review the top 10 gappers — look at gap size, volume, and especially the catalyst summaries. Click News to read full articles for stocks that catch your interest.',
+          label: '1. Around 8:00 AM ET: run Premarket Gappers.',
+          text: 'Treat this as a watchlist builder, not a buy signal. Your goal is to find which stocks are actually in play today because they have a real gap, real volume, and a real story behind the move.',
         },
         {
-          label: 'Filter your list:',
-          text: 'Eliminate stocks with weak catalysts, low volume, or fading momentum (negative Δ Open). Focus on stocks with strong sector tailwinds and good ratings.',
+          label: '2. Read the table before you read the chart.',
+          text: 'Start with gap size, premarket volume, catalyst, sector, and Δ Open. Strong candidates usually have a clean news catalyst, heavy volume, and a gap that is holding up instead of fading immediately.',
         },
         {
-          label: 'Select candidates:',
-          text: 'Check the boxes next to 2–5 stocks you want to monitor. These become inputs for the Trend Join Long strategy.',
+          label: '3. Cut the list down to 2–5 names.',
+          text: 'Remove low-quality gappers: weak or confusing catalysts, thin volume, negative Δ Open, or names that already look exhausted. Keep only the stocks you would actually want to monitor after the open.',
         },
         {
-          label: 'After market open (9:30 AM ET):',
-          text: 'Run Trend Join Long on your selected stocks. The scanner evaluates each one against the daily and intraday breakout criteria.',
+          label: '4. After the open, wait for confirmation — do not buy just because it gapped.',
+          text: 'Premarket only tells you what is interesting. Trend Join Long tells you whether the move is still strengthening during regular hours. This is where the workflow shifts from idea generation to setup confirmation.',
         },
         {
-          label: 'Act on PASS results:',
-          text: 'Stocks that PASS both layers are showing confirmed breakout momentum. Stocks that fail may need more time or may be false starts. Use the date selector to review past scans and see which patterns worked.',
+          label: '5. Run TJL on your shortlist, then rerun it every 30 minutes from about 10:00 AM to 2:00 PM ET.',
+          text: 'In the full repo workflow, TradingView data is collected first and then TJL evaluates those candidates. The best setups do not always trigger right after the bell, so rechecking every 30 minutes helps you catch stocks that break later in the morning or around midday instead of forcing an early trade.',
+        },
+        {
+          label: '6. Read TJL results in plain English.',
+          text: 'PASS means the stock is above yesterday\'s high, above the 200-day moving average, and also breaking above both premarket high and the highest completed intraday high so far. fail_daily means the bigger trend is not strong enough yet. fail_intraday means the trend is okay, but the breakout is not confirmed right now.',
+        },
+        {
+          label: '7. Focus on PASS names first, then confirm them on the chart.',
+          text: 'A PASS is the green light to pay attention, not a blind order button. Use it to decide which chart deserves your time first, then confirm levels, risk, and entry quality manually before taking any trade.',
+        },
+        {
+          label: '8. Review the day after the close.',
+          text: 'Use the saved scan history to compare the morning gappers with the later TJL outcomes. Over time, this teaches you which catalysts and price-action patterns tend to produce real follow-through versus fake-outs.',
         },
       ]),
     },
