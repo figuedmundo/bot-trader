@@ -86,7 +86,7 @@ function safeParseMetadata(value) {
 
 const SCRIPTS_DIR = path.join(ROOT_DIR, 'scripts');
 const COLLECTOR_ARTIFACT_PATH_FOR_RUNS = path.join(ROOT_DIR, '.cache', 'tjl-live-input-today.json');
-const PREMARKET_TIMEOUT_MS = 90_000;
+const PREMARKET_TIMEOUT_MS = Number.parseInt(process.env.PREMARKET_TIMEOUT_MS || '300000', 10);
 const TJL_COLLECT_TIMEOUT_MS = 600_000;
 
 const jobs = new Map();
@@ -223,7 +223,7 @@ async function checkTradingViewBeforeTjl() {
 }
 
 async function runPremarketJob(jobId) {
-  const result = await runScript('python3 scripts/scanner-premarket.py', { timeoutMs: PREMARKET_TIMEOUT_MS });
+  const result = await runScript('python3 scripts/scanner-premarket.py --log', { timeoutMs: PREMARKET_TIMEOUT_MS });
   completeJob(jobId, result);
 }
 
