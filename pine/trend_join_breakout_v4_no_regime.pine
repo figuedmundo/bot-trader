@@ -1,0 +1,97 @@
+//@version=6
+strategy(
+     "Trend Join Breakout v4 — No Regime",
+     overlay=true,
+     initial_capital=100000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10,
+     pyramiding=0,
+     commission_type=strategy.commission.percent,
+     commission_value=0.01,
+     slippage=1,
+     process_orders_on_close=true,
+     calc_on_every_tick=false)
+
+// Trend Join Long strategy backtest.
+//
+// This recreates the Python scanner's entry logic in Pine Script:
+//   1. Current price breaks the previous completed daily high.
+//   2. Previous completed daily close is above the completed daily SMA200.
+//   3. Current price breaks both premarket high and today's regular-session
+//      high-of-day before the current bar.
+//
+// The scanner did not define exits, so this strategy uses explicit configurable
+// backtest exits: a stop just below PMH, an R-multiple target, and an end-of-day
+// flat rule. Treat performance as a v1 assumption test, not the original blog's
+// private strategy source.
+
+string TZ = "America/New_York"
+string PREMARKET_SESSION = "0400-0929"
+string REGULAR_SESSION = "0930-1559"
+string ENTRY_SESSION = "1000-1530"
+string FORCE_FLAT_SESSION = "1555-1600"
+
+riskReward = input.float(2.0, "Target R multiple", minval=0.1, step=0.1)
+stopBufferPct = input.float(0.05, "Stop buffer below PMH (%)", minval=0.0, step=0.01)
+useEodExit = input.bool(true, "Force flat near end of day")
+showLevels = input.bool(true, "Show TJL levels")
+
+isPremarket = not na(time(timeframe.period, PREMARKET_SESSION, TZ))
+isRegular = not na(time(timeframe.period, REGULAR_SESSION, TZ))
+isEntryWindow = not na(time(timeframe.period, ENTRY_SESSION, TZ))
+isForceFlatWindow = not na(time(timeframe.period, FORCE_FLAT_SESSION, TZ))
+isNewDay = ta.change(time("D")) != 0
+
+prevDailyHigh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+prevDailyClose = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_off)
+dailySma200 = request.security(syminfo.tickerid, "D", ta.sma(close, 200)[1], lookahead=barmerge.lookahead_off)
+
+var float pmh = na
+var float regularHod = na
+var float activeStop = na
+var float activeTarget = na
+
+if isNewDay
+    pmh := na
+    regularHod := na
+    activeStop := na
+    activeTarget := na
+
+if isPremarket
+    pmh := na(pmh) ? high : math.max(pmh, high)
+
+todayHodBeforeCurrentBar = regularHod
+
+dailyBreakout = close > prevDailyHigh and prevDailyClose > dailySma200
+intradayBreakout = not na(pmh) and not na(todayHodBeforeCurrentBar) and close > pmh and close > todayHodBeforeCurrentBar
+entrySignal = strategy.position_size == 0 and isEntryWindow and dailyBreakout and intradayBreakout
+
+if entrySignal
+    stopCandidate = pmh * (1.0 - stopBufferPct / 100.0)
+    risk = close - stopCandidate
+    if risk > syminfo.mintick
+        activeStop := stopCandidate
+        activeTarget := close + risk * riskReward
+        strategy.entry("TJL Long", strategy.long)
+
+if strategy.position_size > 0 and not na(activeStop) and not na(activeTarget)
+    strategy.exit("TJL Stop/Target", from_entry="TJL Long", stop=activeStop, limit=activeTarget)
+
+if useEodExit and strategy.position_size > 0 and isForceFlatWindow
+    strategy.close("TJL Long", comment="EOD flat")
+    activeStop := na
+    activeTarget := na
+
+if isRegular
+    regularHod := na(regularHod) ? high : math.max(regularHod, high)
+
+plot(showLevels ? pmh : na, "Premarket High", color=color.new(color.orange, 0), linewidth=2, style=plot.style_linebr)
+plot(showLevels ? todayHodBeforeCurrentBar : na, "HOD Before Current Bar", color=color.new(color.aqua, 0), style=plot.style_linebr)
+plot(showLevels ? prevDailyHigh : na, "Previous Daily High", color=color.new(color.purple, 0), style=plot.style_linebr)
+plot(showLevels ? dailySma200 : na, "Daily SMA200", color=color.new(color.gray, 25))
+plot(showLevels ? activeStop : na, "Active Stop", color=color.new(color.red, 0), style=plot.style_linebr)
+plot(showLevels ? activeTarget : na, "Active Target", color=color.new(color.green, 0), style=plot.style_linebr)
+
+plotshape(entrySignal, title="TJL Long Signal", style=shape.triangleup, location=location.belowbar, color=color.new(color.lime, 0), size=size.small, text="TJL")
+
+alertcondition(entrySignal, title="TJL Long", message="Trend Join Long breakout on {{ticker}}")
